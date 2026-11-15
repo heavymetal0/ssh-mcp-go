@@ -1,0 +1,23 @@
+# 编译产物（体积大且可由 go build 重新生成）
+/ssh-mcp-go
+*.exe
+*.dll
+*.so
+*.dylib
+
+# 真实配置可能含服务器地址/凭据，一律不入库；只提交示例配置
+ssh-mcp.toml
+*.local.toml
+.env
+.env.*
+
+# 编辑器 / 系统文件
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# 测试与覆盖率产物
+*.test
+*.out
+coverage.txt
