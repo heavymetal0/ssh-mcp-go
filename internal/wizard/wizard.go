@@ -15,13 +15,9 @@ import (
 )
 
 // recommendedCommands 是向导默认提供的"推荐允许命令"列表。
-var recommendedCommands = []string{
-	"uname", "hostname", "uptime", "date",
-	"df", "free", "ps", "top",
-	"ls", "cat", "head", "tail", "grep",
-	"systemctl", "docker",
-	"cp", "mv", "rm", "mkdir", "rsync", "tar",
-}
+// 直接复用 config 包的开箱即用默认白名单（源自原版 hitelist 的安全常用命令），
+// 避免两处各自维护导致不一致。
+var recommendedCommands = config.DefaultAllowCommands
 
 // stepDef 描述向导的某一步：收集哪个字段、如何提问、如何校验。
 type stepDef struct {

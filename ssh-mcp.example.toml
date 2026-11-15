@@ -44,14 +44,32 @@ username = "your_user"
 password = "******"          # 建议改为 private_key 并 chmod 600
 # private_key = "~/.ssh/id_ed25519"
 
-# 允许执行的命令：只写命令名。程序会自动把参数里的路径限制在 roots 内。
-# 写命令（cp/mv/rm/mkdir/rsync/tar 等）同样需要列在这里，是否真能写还受 read_only 与 roots 约束。
+# 允许执行的命令：只写命令名（首词），无需正则。以下为开箱即用的默认白名单，
+# 由原版 hitelist 按"安全 + 群晖常用"筛选去重而来；与向导推荐列表、Go 内置
+# config.DefaultAllowCommands 保持一致。程序自动把命令里的路径参数限制在 roots 内，
+# 写/改类命令另受 read_only 与 roots 双重约束。可按需要删减。
 allow_commands = [
-  "uname", "hostname", "uptime", "date",
-  "df", "free", "ps", "top",
-  "ls", "cat", "head", "tail", "grep",
-  "systemctl", "docker",
-  "cp", "mv", "rm", "mkdir", "rsync", "tar"
+  # 系统信息 / 监控
+  "uname", "hostname", "uptime", "date", "id", "who", "last", "which", "env",
+  "ps", "top", "htop", "free", "df", "du", "lscpu", "vmstat", "iostat",
+  "dmesg", "lsmod", "lsblk", "mount", "netstat", "ss", "ip", "ifconfig", "getent",
+  # 网络诊断 / 连通性
+  "ping", "traceroute", "traceroute6", "mtr", "nslookup", "dig", "host",
+  "curl", "wget", "openssl", "echo", "sleep",
+  # 文件与文本查看（只读）
+  "ls", "cat", "head", "tail", "grep", "egrep", "wc", "stat", "find", "file",
+  "less", "more", "tree", "strings", "nl", "diff",
+  "awk", "cut", "sort", "uniq", "tr", "jq", "column", "paste",
+  # 服务 / 套件状态查询
+  "systemctl", "synoservice", "synoservicecfg", "synopkg",
+  # 容器（docker ps / docker compose up 等子命令均由首词 docker 放行）
+  "docker",
+  # 写 / 改类（受 read_only 与 roots 双重约束）
+  "kill", "pkill", "mkdir", "cp", "mv", "rm", "rmdir", "tar", "touch", "ln",
+  "chmod", "chown", "chgrp", "rsync", "rclone", "dd", "truncate", "install",
+  "patch", "tee", "sed", "vi", "vim", "nano",
+  "bash", "sh", "nohup", "setsid", "python3", "pip3", "pip", "ssh"
+  # 注：sudo 作为前缀由程序自动剥离，其后真实命令仍须在本列表内
 ]
 
 # 受保护的根目录：命令参数中的路径与所有 SFTP 操作都必须落在这些目录内。

@@ -23,8 +23,15 @@ import (
 var writeCommands = map[string]bool{
 	"cp": true, "mv": true, "rm": true, "rmdir": true, "mkdir": true,
 	"touch": true, "ln": true, "chmod": true, "chown": true, "chgrp": true,
-	"rsync": true, "tar": true, "dd": true, "tee": true, "install": true,
-	"truncate": true, "shred": true,
+	"rsync": true, "rclone": true, "tar": true, "dd": true, "tee": true,
+	"install": true, "truncate": true, "shred": true, "patch": true,
+	"vi": true, "vim": true, "nano": true, "sed": true,
+	// 进程控制类：终止进程会改变系统状态，纳入写命令受 read_only 约束
+	"kill": true, "pkill": true,
+	// 解释器 / 脚本 / 远程执行：能写文件或执行任意代码，必须受 roots 与 read_only 约束
+	"bash": true, "sh": true, "python3": true, "python": true,
+	"pip3": true, "pip": true, "ssh": true,
+	"nohup": true, "setsid": true,
 }
 
 // protectedDirs 是程序硬封锁的系统目录（只要启用了目录权限就始终生效，
@@ -74,7 +81,11 @@ func ValidateCommand(allowCommands, roots []string, readOnly bool, dirPolicy str
 		return CommandResult{Blocked: true, Reason: "空命令"}
 	}
 	fields := strings.Fields(cmd)
-	first := fields[0]
+	// 剥离前导 sudo（及其选项），用真实命令做白名单/写命令判定，
+	// 防止 "sudo <任意命令>" 借 sudo 首词绕过策略。
+	// 无论是否带 sudo，真实命令都必须在 allow_commands 内。
+	cmdFields := stripSudo(fields)
+	first := cmdFields[0]
 	if !slices.Contains(allowCommands, first) {
 		return CommandResult{
 			Blocked:    true,
@@ -87,7 +98,7 @@ func ValidateCommand(allowCommands, roots []string, readOnly bool, dirPolicy str
 		return CommandResult{Blocked: true, Reason: fmt.Sprintf("当前为只读模式，禁止写命令 %q", first)}
 	}
 	dp := normalizeDirPolicy(dirPolicy)
-	for _, f := range fields[1:] {
+	for _, f := range cmdFields[1:] {
 		if !looksLikePath(f) {
 			continue
 		}
@@ -236,6 +247,36 @@ func suggestRoot(raw, clean string) string {
 		return filepath.Dir(clean)
 	}
 	return clean
+}
+
+// stripSudo 剥离命令开头的一个 sudo 及其选项，返回剩余字段（真实命令在前）。
+// 支持：sudo cmd / sudo -n cmd / sudo -u user cmd / sudo -u=root cmd / sudo -H -n cmd。
+// 若首词不是 sudo 或剥离后为空，则原样返回。
+func stripSudo(fields []string) []string {
+	if len(fields) == 0 || fields[0] != "sudo" {
+		return fields
+	}
+	i := 1
+	for i < len(fields) {
+		tok := fields[i]
+		if tok == "--" {
+			i++
+			break
+		}
+		if !strings.HasPrefix(tok, "-") {
+			break // 找到真实命令
+		}
+		// -u/-g 单独出现时消耗下一个参数；-u=user/-g=group 形式不消耗
+		if (tok == "-u" || tok == "-g" || tok == "--user" || tok == "--group") && i+1 < len(fields) {
+			i += 2
+		} else {
+			i++
+		}
+	}
+	if i >= len(fields) {
+		return fields // sudo 后无命令，原样返回由后续判定处理
+	}
+	return fields[i:]
 }
 
 // IsWriteCommand 供外部判断某命令是否为写命令（用于审计/提示）。

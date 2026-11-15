@@ -90,6 +90,46 @@ func Load(path string) (*Config, error) {
 	return c, nil
 }
 
+// DefaultAllowCommands 是内置的开箱即用命令白名单（首词，纯命令名，无正则）。
+//
+// 来源：原版 ssh-mcp 的 hitelist 白名单，按"安全 + 群晖常用"筛选并去重后重组。
+// 重写版的策略模型与原版不同：
+//   - 这里只声明"允许哪些命令首词"，不做整行正则匹配；
+//   - 命令里的路径参数由 roots + dir_policy 自动门禁（防穿越、系统目录封锁）；
+//   - 写/改类命令另由 policy.writeCommands 识别，受 read_only 与 roots 约束。
+//
+// 因此原版那些 sudo 前缀、全路径 docker、目录锚定等正则都不再需要——
+// 只要首词在此列表内，子命令与参数由 Go 程序统一判定。
+var DefaultAllowCommands = []string{
+	// ── 系统信息 / 监控（只读，路径无关）──
+	"uname", "hostname", "uptime", "date", "id", "who", "last", "which", "env",
+	"ps", "top", "htop", "free", "df", "du", "lscpu", "vmstat", "iostat",
+	"dmesg", "lsmod", "lsblk", "mount", "netstat", "ss", "ip", "ifconfig", "getent",
+
+	// ── 网络诊断 / 连通性（只读低危）──
+	"ping", "traceroute", "traceroute6", "mtr", "nslookup", "dig", "host",
+	"curl", "wget", "openssl", "echo", "sleep",
+
+	// ── 文件与文本查看（只读）──
+	"ls", "cat", "head", "tail", "grep", "egrep", "wc", "stat", "find", "file",
+	"less", "more", "tree", "strings", "nl", "diff",
+	"awk", "cut", "sort", "uniq", "tr", "jq", "column", "paste",
+
+	// ── 服务 / 套件状态查询（只读）──
+	"systemctl", "synoservice", "synoservicecfg", "synopkg",
+
+	// ── 容器（docker 子命令由程序放行，如 ps / compose up）──
+	"docker",
+
+	// ── 写 / 改类（受 read_only 与 roots 双重约束）──
+	"kill", "pkill", "mkdir", "cp", "mv", "rm", "rmdir", "tar", "touch", "ln",
+	"chmod", "chown", "chgrp", "rsync", "rclone", "dd", "truncate", "install",
+	"patch", "tee", "sed", "vi", "vim", "nano",
+	"bash", "sh", "nohup", "setsid", "python3", "pip3", "pip", "ssh",
+	// 注：sudo 作为前缀由策略层自动剥离，其后真实命令仍须在本列表内，
+	// 因此无需（也不应）把 sudo 本身当作可放行命令。
+}
+
 // DefaultDefaults 返回一组合理的默认超时/连接参数。
 func DefaultDefaults() Defaults {
 	return Defaults{
