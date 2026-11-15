@@ -31,7 +31,7 @@ func main() {
 	} else {
 		defer stop()
 	}
-	if cfg.NeedsSetup {
+	if cfg.NeedSetup() {
 		log.Printf("提示: 未找到有效配置（%s），请先调用 setup-wizard 工具完成配置。", *configPath)
 	}
 
@@ -39,9 +39,10 @@ func main() {
 	mgr := approval.NewManager()
 	handler := mcp.NewHandler(cfg, pool, mgr)
 	server := mcp.NewServer(handler.Dispatch)
+	defer handler.Shutdown() // 退出时关闭转发、连接池与配置监听
 
 	fmt.Fprintln(os.Stderr, "ssh-mcp-go 已启动，监听 stdio (MCP)")
 	if err := server.Serve(os.Stdin); err != nil {
-		log.Fatalf("服务异常: %v", err)
+		log.Printf("服务结束: %v", err)
 	}
 }

@@ -31,6 +31,9 @@ type forwardEntry struct {
 	listener net.Listener
 	done     chan struct{}
 	once     sync.Once
+
+	mu    sync.Mutex
+	conns map[net.Conn]struct{} // 活动连接，Stop 时一并关闭
 }
 
 // ForwardManager 管理全部本地转发，按本地监听地址索引。
@@ -40,20 +43,18 @@ type ForwardManager struct {
 	pool  *Pool
 }
 
-// NewForwardManager 创建转发管理器。
 func NewForwardManager(pool *Pool) *ForwardManager {
 	return &ForwardManager{items: map[string]*forwardEntry{}, pool: pool}
 }
 
-// Start 启动一条本地转发。srv 是已解析好的目标服务器；local/remote 分别是
-// 本机监听地址与远程目标地址（均支持省略 IP 的写法，见 normalizeListenAddr）。
+// Start 启动一条本地转发。srv 是已解析好的目标服务器。
+// 出于安全，本地监听地址强制绑定到 127.0.0.1（不暴露到局域网/公网）。
 func (m *ForwardManager) Start(srv config.Server, local, remote string) (Forward, error) {
-	local = normalizeListenAddr(local)
-	remote = normalizeListenAddr(remote)
+	local = loopbackAddr(local)
+	remote = normalizeRemoteAddr(remote)
 	if local == "" || remote == "" {
 		return Forward{}, fmt.Errorf("local 与 remote 均不能为空")
 	}
-	// 先确保 SSH 连接可用；转发依赖该连接长期存活。
 	client, err := m.pool.Get(srv)
 	if err != nil {
 		return Forward{}, fmt.Errorf("连接服务器失败: %w", err)
@@ -73,6 +74,7 @@ func (m *ForwardManager) Start(srv config.Server, local, remote string) (Forward
 		Forward:  Forward{ID: local, LocalAddr: local, RemoteAddr: remote, Server: srv.Name},
 		listener: ln,
 		done:     make(chan struct{}),
+		conns:    map[net.Conn]struct{}{},
 	}
 	m.items[local] = entry
 	m.mu.Unlock()
@@ -85,32 +87,64 @@ func (m *ForwardManager) serve(entry *forwardEntry, client *cryptossh.Client) {
 	for {
 		conn, err := entry.listener.Accept()
 		if err != nil {
-			return // 监听器关闭（主动 stop 或异常）时退出
+			// 监听器被关闭（主动 stop）或异常退出：清理条目，避免
+			// List 仍显示一条已死的转发、且 Start 因"已存在"无法重建。
+			select {
+			case <-entry.done:
+			default:
+				m.remove(entry.LocalAddr)
+			}
+			return
 		}
-		go pipe(conn, client, entry.RemoteAddr)
+		entry.mu.Lock()
+		entry.conns[conn] = struct{}{}
+		entry.mu.Unlock()
+		go func(c net.Conn) {
+			defer func() {
+				entry.mu.Lock()
+				delete(entry.conns, c)
+				entry.mu.Unlock()
+			}()
+			pipe(c, client, entry.RemoteAddr, entry.done)
+		}(conn)
 	}
 }
 
 // pipe 把单个本地连接转发到远程目标，双向拷贝，任一端结束即关闭两端。
-func pipe(local net.Conn, client *cryptossh.Client, remote string) {
+func pipe(local net.Conn, client *cryptossh.Client, remote string, done <-chan struct{}) {
 	rc, err := client.Dial("tcp", remote)
 	if err != nil {
 		local.Close()
 		return
 	}
+	var once sync.Once
+	closed := make(chan struct{})
+	closeBoth := func() {
+		once.Do(func() {
+			rc.Close()
+			local.Close()
+			close(closed) // 唤醒下面的监听 goroutine，避免泄漏
+		})
+	}
+	// 转发被 stop 时主动断开活动连接；正常结束时由 closed 唤醒退出。
+	go func() {
+		select {
+		case <-done:
+			closeBoth()
+		case <-closed:
+		}
+	}()
 	go func() {
 		_, _ = io.Copy(rc, local)
-		rc.Close()
+		closeBoth()
 	}()
-	go func() {
-		_, _ = io.Copy(local, rc)
-		local.Close()
-	}()
+	_, _ = io.Copy(local, rc)
+	closeBoth()
 }
 
-// Stop 停止指定本地地址的转发（幂等）。
+// Stop 停止指定本地地址的转发（幂等），并关闭该转发的所有活动连接。
 func (m *ForwardManager) Stop(id string) bool {
-	id = normalizeListenAddr(id)
+	id = loopbackAddr(id)
 	m.mu.Lock()
 	entry, ok := m.items[id]
 	if ok {
@@ -123,11 +157,31 @@ func (m *ForwardManager) Stop(id string) bool {
 	entry.once.Do(func() {
 		close(entry.done)
 		entry.listener.Close()
+		entry.mu.Lock()
+		for c := range entry.conns {
+			_ = c.Close()
+		}
+		entry.conns = map[net.Conn]struct{}{}
+		entry.mu.Unlock()
 	})
 	return true
 }
 
-// List 返回当前全部转发，按本地地址排序。
+func (m *ForwardManager) remove(id string) {
+	m.mu.Lock()
+	entry, ok := m.items[id]
+	if ok {
+		delete(m.items, id)
+	}
+	m.mu.Unlock()
+	if ok {
+		entry.once.Do(func() {
+			close(entry.done)
+			entry.listener.Close()
+		})
+	}
+}
+
 func (m *ForwardManager) List() []Forward {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -146,8 +200,26 @@ func (m *ForwardManager) StopAll() {
 	}
 }
 
-// normalizeListenAddr 为纯端口或 :端口 补足默认监听 IP（仅本机可达）。
-func normalizeListenAddr(addr string) string {
+// loopbackAddr 把本地监听地址规范化为"仅回环"。
+// 无论用户传 8080 / :8080 / 0.0.0.0:8080，都只监听 127.0.0.1，
+// 防止误把 SSH 转发暴露到局域网或公网。
+func loopbackAddr(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return ""
+	}
+	port := addr
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		port = addr[i+1:]
+	}
+	if port == "" {
+		return ""
+	}
+	return "127.0.0.1:" + port
+}
+
+// normalizeRemoteAddr 为纯端口或 :端口 补足本机地址（从 SSH 服务器视角）。
+func normalizeRemoteAddr(addr string) string {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
 		return ""

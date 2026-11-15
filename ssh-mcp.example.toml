@@ -1,25 +1,29 @@
 # ssh-mcp-go 示例配置（全量重写版，配置只声明"意图"）
 #
-# 设计原则：复杂的策略判定（命令分类、路径门禁、穿越拦截、系统目录封锁）
-# 全部写在程序里，配置文件里只写两样东西：
-#   1. allow_commands：允许执行的命令名（写名字即可，无需正则）
-#   2. roots：受保护的根目录，命令里的路径参数与所有 SFTP 操作都必须落在其中
+# 设计原则：复杂的策略判定（复合命令分段、命令分类、路径门禁、穿越拦截、
+# 系统目录封锁、sudo/env 前缀剥离）全部写在程序里，配置文件里只写两样东西：
+#   1. allow_commands：允许执行的命令名（写名字即可，无需正则）；省略即用内置 100 命令
+#   2. roots：受保护的根目录，命令里的路径参数与所有 SFTP 操作默认必须落在其中
 #
 # 运行：ssh-mcp-go --config ssh-mcp.toml
-# 热重载：保存后约 2 秒内自动生效，无需重启
+# 热重载：监听配置所在目录，保存后约 0.1 秒（80ms 去抖）自动生效，无需重启
 
 [defaults]
 # 单条命令执行超时：execute-command 的 timeout 参数可覆盖（如 timeout="30s"），
-# 未传时采用此值。支持 Go 时长写法：30s / 5m / 2h。
+# 未传时采用此值。支持 Go 时长写法：30s / 5m / 2h。审批放行后的重试保留原 timeout。
 command_timeout     = "120m"
-# SSH 建连超时：连接服务器时的握手等待上限（已实际生效）。
+# SSH 建连超时：连接服务器时的握手等待上限。
 connection_timeout  = "30s"
+# 单次 SFTP 操作超时：列目录 / 上传 / 下载 / 目录同步，超时即关闭该次 SFTP 会话。
 sftp_timeout        = "5m"
-# 心跳：每 keepalive_interval 发一次；连续 keepalive_count_max 次失败则判定掉线。
+# 心跳：每 keepalive_interval 发一次；连续 keepalive_count_max 次底层错误则判定掉线。
+# 服务器正常回复"不支持该扩展"不算失败，不会误杀健康连接。
 keepalive_interval  = "15s"
 keepalive_count_max = 3
-# 命令输出上限（字节）：超过即截断并标注。默认 20MB。同时影响 stdio 行缓冲。
+# 命令输出上限（字节）：超过即截断并标注，避免撑爆 stdio。<=0 不截断。
+# 仅作用于 execute-command / server-status；list-remote 的列表输出暂不受此限。
 max_output_bytes    = 20971520
+# 传输方式：预留字段，当前版本未参与逻辑。
 transport           = "exec"
 
 # 主机密钥校验策略（安全）：
@@ -27,12 +31,16 @@ transport           = "exec"
 #   known_hosts —— 严格校验 known_hosts 文件中的主机公钥，防中间人攻击；
 #                  文件不存在或不匹配将拒绝连接。可先用 ssh-keyscan 生成：
 #                  ssh-keyscan -p 22 192.168.1.10 >> ~/.ssh/known_hosts
+#   填写其它未知值会直接拒绝连接（fail-closed），不会静默降级为不校验。
 host_key_policy  = "insecure"
 # known_hosts_file = "~/.ssh/known_hosts"   # 留空即用此默认路径
 
 # 审批模式（关键功能）：被策略拦截时工具如何响应。
 #   ask   —— 默认：以对话式交互询问是否追加命令名/根目录（需调用 approve_last / deny_last）
+#            pending 请求有效期 10 分钟，只保留最近一条。
 #   deny  —— 直接返回 PermissionDenied，不询问；用于兼容不支持审批流的客户端
+# 注：系统目录硬封锁 / 只读违规 / 命令替换 / 路径穿越等"无可放宽建议"的硬拦截，
+#     在 ask 模式下也直接拒绝，不会弹出一个批准后什么都不会发生的无效询问。
 # 每个 [[server]] 可用 approval_mode 单独覆盖；不写则继承此处（默认 ask）。
 approval_mode = "ask"
 
@@ -46,8 +54,11 @@ password = "******"          # 建议改为 private_key 并 chmod 600
 
 # 允许执行的命令：只写命令名（首词），无需正则。以下为开箱即用的默认白名单，
 # 由原版 hitelist 按"安全 + 群晖常用"筛选去重而来；与向导推荐列表、Go 内置
-# config.DefaultAllowCommands 保持一致。程序自动把命令里的路径参数限制在 roots 内，
-# 写/改类命令另受 read_only 与 roots 双重约束。可按需要删减。
+# config.DefaultAllowCommands 保持一致。可整段省略，程序会自动用这份默认值；
+# 省略后若通过审批放行新命令，程序会把完整数组行自动补写进本文件。
+# 复合命令（; && || | 换行）会逐段校验，每段首词都须在此列表；sudo/env 等前缀
+# 由程序自动剥离。docker rm/up/down、systemctl restart、curl -o、find -delete
+# 等写子命令在 read_only=true 时会被额外拦截。
 allow_commands = [
   # 系统信息 / 监控
   "uname", "hostname", "uptime", "date", "id", "who", "last", "which", "env",
@@ -72,17 +83,19 @@ allow_commands = [
   # 注：sudo 作为前缀由程序自动剥离，其后真实命令仍须在本列表内
 ]
 
-# 受保护的根目录：命令参数中的路径与所有 SFTP 操作都必须落在这些目录内。
-# 程序自动拦截 ".." 穿越、相对路径越权、符号链接逃逸，并硬封锁 /etc /root /volume1 等系统目录。
-# 无需在配置里写任何黑名单。
+# 受保护的根目录：命令参数中的路径与所有 SFTP 操作默认必须落在这些目录内。
+# 程序自动拦截 ".." 穿越、相对路径越权，并硬封锁 /etc /root /volume1 等 13 个系统目录。
+# 复合参数（如 docker -v /etc:/etc、key=value、--mount a=b,c=d）会按 : , = 拆分
+# 逐片段检查，堵住用冒号绕过系统目录封锁的写法。无需在配置里写任何黑名单。
 roots = ["/volume/docker/"]
 
 # 目录权限模式（关键功能）：
 #   off         —— 不启用目录权限，路径完全不限制
 #   strict      —— 最严格：读、写都限制在 roots 内，超出一律拒绝（默认）
 #   read_beyond —— 推荐/常用：读操作可超越 roots，写/改操作不能超越 roots
-# 只要启用了目录权限（strict / read_beyond），/etc /root /volume1 等系统目录始终硬封锁。
+# 只要启用了目录权限（strict / read_beyond），系统目录始终硬封锁，审批也无法放宽。
 dir_policy = "read_beyond"
 
-# 只读模式：true 时禁止一切写命令（即便列在 allow_commands）。默认 false。
+# 只读模式：true 时禁止一切写命令与有写副作用的子命令（即便列在 allow_commands）。
+# 默认 false。
 read_only = false

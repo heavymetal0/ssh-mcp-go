@@ -8,6 +8,10 @@
 //
 // 防穿越、写命令识别、系统目录封锁、读/写越界策略等复杂逻辑全部在此硬编码，
 // 不依赖配置文件里的正则黑名单。
+//
+// 已知边界（见 README）：白名单放行的是"命令名"，不隔离命令内部行为。一旦
+// allow_commands 里包含 bash/sh/python3/ssh 等解释器或远程执行器，它们照样能
+// 运行任意子程序；命令替换 $()/反引号/进程替换被硬拒绝，其余属于意图级门禁。
 package policy
 
 import (
@@ -19,36 +23,77 @@ import (
 
 // writeCommands 是内建的"写/改"命令集合。read_only=true 时一律禁止，
 // 目录权限为 strict/read_beyond 时其路径参数必须落在 roots 内。
-// 这是程序内判定，不出现在配置文件中。
 var writeCommands = map[string]bool{
 	"cp": true, "mv": true, "rm": true, "rmdir": true, "mkdir": true,
 	"touch": true, "ln": true, "chmod": true, "chown": true, "chgrp": true,
 	"rsync": true, "rclone": true, "tar": true, "dd": true, "tee": true,
 	"install": true, "truncate": true, "shred": true, "patch": true,
 	"vi": true, "vim": true, "nano": true, "sed": true,
-	// 进程控制类：终止进程会改变系统状态，纳入写命令受 read_only 约束
 	"kill": true, "pkill": true,
-	// 解释器 / 脚本 / 远程执行：能写文件或执行任意代码，必须受 roots 与 read_only 约束
 	"bash": true, "sh": true, "python3": true, "python": true,
 	"pip3": true, "pip": true, "ssh": true,
 	"nohup": true, "setsid": true,
 }
 
+// writeSubcommands 列出"首词本身不是写命令、但特定子命令/选项会产生写副作用"的情况。
+// 典型如 docker rm、systemctl restart、curl -o、find -delete。若不识别，
+// read_only 与"写路径必须落在 roots 内"会被这些命令悄悄绕过。
+var writeSubcommands = map[string]map[string]bool{
+	"docker": {
+		"run": true, "rm": true, "rmi": true, "start": true, "stop": true,
+		"restart": true, "kill": true, "pull": true, "push": true,
+		"build": true, "create": true, "cp": true, "exec": true,
+		"pause": true, "unpause": true, "update": true, "rename": true,
+		"commit": true, "import": true, "load": true, "save": true,
+		"up": true, "down": true,
+	},
+	"docker-compose": {
+		"up": true, "down": true, "start": true, "stop": true, "restart": true,
+		"pull": true, "push": true, "build": true, "create": true, "rm": true,
+		"run": true, "exec": true, "kill": true,
+	},
+	"systemctl": {
+		"start": true, "stop": true, "restart": true, "reload": true,
+		"enable": true, "disable": true, "mask": true, "unmask": true,
+		"isolate": true, "daemon-reload": true, "set-default": true,
+	},
+	"synopkg": {
+		"start": true, "stop": true, "restart": true, "update": true,
+		"upgrade": true, "install": true, "uninstall": true,
+	},
+	"synoservice": {
+		"--start": true, "--stop": true, "--restart": true,
+		"--enable": true, "--disable": true,
+	},
+	"synoservicecfg": {
+		"--start": true, "--stop": true, "--restart": true,
+		"--enable": true, "--disable": true,
+	},
+	"curl": {"-o": true, "-O": true, "--output": true, "-T": true, "--upload-file": true},
+	"wget": {"-O": true, "--output-document": true},
+	"find": {"-delete": true, "-exec": true, "-execdir": true, "-ok": true, "-fprint": true},
+}
+
+// prefixCommands 是"前缀包装命令"：它们后面跟的才是真正要执行的命令。
+// 校验时必须剥离，否则 "env FOO=1 <任意命令>" 会借 env 首词绕过白名单。
+var prefixCommands = map[string]bool{
+	"sudo": true, "env": true, "nohup": true, "setsid": true,
+	"nice": true, "ionice": true, "command": true,
+}
+
 // protectedDirs 是程序硬封锁的系统目录（只要启用了目录权限就始终生效，
-// 无论 roots 如何配置、也不可通过审批放宽）。这是程序内判定。
+// 无论 roots 如何配置、也不可通过审批放宽）。
 var protectedDirs = []string{
 	"/etc", "/root", "/usr", "/bin", "/sbin", "/boot", "/sys", "/lib",
 	"/lib64", "/proc", "/dev", "/var", "/volume1",
 }
 
-// DirPolicy 取值：目录权限模式。
 const (
-	DirOff        = "off"         // 不启用目录权限
-	DirStrict     = "strict"      // 最严格：读写都限制在 roots 内
-	DirReadBeyond = "read_beyond" // 推荐：读可超越 roots，写/改不能超越
+	DirOff        = "off"
+	DirStrict     = "strict"
+	DirReadBeyond = "read_beyond"
 )
 
-// normalizeDirPolicy 把任意字符串规整为合法的目录权限模式；非法/空值回退到最严格的 strict。
 func normalizeDirPolicy(s string) string {
 	switch s {
 	case DirOff, DirStrict, DirReadBeyond:
@@ -58,33 +103,53 @@ func normalizeDirPolicy(s string) string {
 	}
 }
 
-// CommandResult 是命令校验结果。
 type CommandResult struct {
 	Allowed    bool
-	Blocked    bool   // 是否被策略拦截（与 Allowed 相反，语义更明确）
-	Reason     string // 拦截原因
-	AddCommand string // 建议加入 allow_commands 的命令名（命令名未授权时）
-	AddRoot    string // 建议加入 roots 的目录（路径越权且非系统目录时）
+	Blocked    bool
+	Reason     string
+	AddCommand string
+	AddRoot    string
 }
 
-// ValidateCommand 校验命令：
-//  1. 首词必须是 allow_commands 之一，否则拦截并建议追加该命令名；
-//  2. read_only=true 且首词为写命令时，拦截；
-//  3. 抽取命令中的路径参数，按目录权限模式做门禁：
-//     - off：不限制；
-//     - strict：读/写路径都必须落在 roots 内；
-//     - read_beyond：写/改路径必须落在 roots 内，读路径可超越 roots；
-//     - 系统目录（protectedDirs）只要启用目录权限就始终硬封锁。
+type shellSegment struct {
+	text     string
+	redirect bool // 含输出重定向（> / >>），视作写操作
+}
+
+// ValidateCommand 校验一条待执行命令。
+//
+// 关键点：命令最终是整条交给远端 shell 执行的，因此不能只校验"第一个词"。
+// 本函数先按 ; && || | 换行 把复合命令拆成多个子命令，逐个子命令校验
+// 首词白名单 / 写命令 / 路径门禁；任何一段不合法即整条拒绝。这样既保留
+// "ps aux | grep"、"cmd1 && cmd2" 等正常运维写法，又堵住 "ls ; rm -rf /"
+// 借首词白名单夹带未授权命令的漏洞。命令替换 $() / 反引号 / 进程替换 <(、
+// 未闭合引号一律拒绝（无法静态判定其内容）。
 func ValidateCommand(allowCommands, roots []string, readOnly bool, dirPolicy string, cmd string) CommandResult {
 	cmd = strings.TrimSpace(cmd)
 	if cmd == "" {
 		return CommandResult{Blocked: true, Reason: "空命令"}
 	}
-	fields := strings.Fields(cmd)
-	// 剥离前导 sudo（及其选项），用真实命令做白名单/写命令判定，
-	// 防止 "sudo <任意命令>" 借 sudo 首词绕过策略。
-	// 无论是否带 sudo，真实命令都必须在 allow_commands 内。
-	cmdFields := stripSudo(fields)
+	segments, ok := splitShellSegments(cmd)
+	if !ok {
+		return CommandResult{Blocked: true, Reason: "命令含命令替换 $()/反引号/进程替换或未闭合引号，无法安全校验，已拒绝"}
+	}
+	if len(segments) == 0 {
+		return CommandResult{Blocked: true, Reason: "空命令"}
+	}
+	for _, seg := range segments {
+		if r := validateSegment(allowCommands, roots, readOnly, dirPolicy, seg); r.Blocked {
+			return r
+		}
+	}
+	return CommandResult{Allowed: true}
+}
+
+func validateSegment(allowCommands, roots []string, readOnly bool, dirPolicy string, seg shellSegment) CommandResult {
+	fields := strings.Fields(seg.text)
+	if len(fields) == 0 {
+		return CommandResult{Allowed: true}
+	}
+	cmdFields := stripPrefixes(fields)
 	first := cmdFields[0]
 	if !slices.Contains(allowCommands, first) {
 		return CommandResult{
@@ -93,12 +158,12 @@ func ValidateCommand(allowCommands, roots []string, readOnly bool, dirPolicy str
 			AddCommand: first,
 		}
 	}
-	isWrite := writeCommands[first]
+	isWrite := writeCommands[first] || seg.redirect || hasWriteSubcommand(first, fields[1:])
 	if readOnly && isWrite {
-		return CommandResult{Blocked: true, Reason: fmt.Sprintf("当前为只读模式，禁止写命令 %q", first)}
+		return CommandResult{Blocked: true, Reason: fmt.Sprintf("当前为只读模式，禁止写命令/写操作 %q", first)}
 	}
 	dp := normalizeDirPolicy(dirPolicy)
-	for _, f := range cmdFields[1:] {
+	for _, f := range fields[1:] {
 		if !looksLikePath(f) {
 			continue
 		}
@@ -119,16 +184,12 @@ func ValidateCommand(allowCommands, roots []string, readOnly bool, dirPolicy str
 	return CommandResult{Allowed: true}
 }
 
-// PathResult 是路径校验结果。
 type PathResult struct {
 	Allowed bool
 	Reason  string
 	AddRoot string
 }
 
-// ValidateSftpPath 校验 SFTP 类路径（list-remote=读，download=读，upload=写）。
-// 语义与命令路径一致：off 不限制；strict 全都限制在 roots 内；read_beyond
-// 下读操作可超越 roots、写操作（upload）不能超越；系统目录始终硬封锁。
 func ValidateSftpPath(roots []string, dirPolicy, op, p string) PathResult {
 	if p == "" {
 		return PathResult{Allowed: false, Reason: "空路径"}
@@ -140,9 +201,12 @@ func ValidateSftpPath(roots []string, dirPolicy, op, p string) PathResult {
 	if isProtected(p) {
 		return PathResult{Allowed: false, Reason: fmt.Sprintf("路径 %q 命中系统目录，已被拦截", p)}
 	}
+	if strings.Contains(p, "..") {
+		return PathResult{Allowed: false, Reason: fmt.Sprintf("路径 %q 含目录穿越，已被拦截", p)}
+	}
 	isWrite := op == "write"
 	if dp == DirReadBeyond && !isWrite {
-		return PathResult{Allowed: true} // 读操作可超越 roots
+		return PathResult{Allowed: true}
 	}
 	ok, suggest := withinRoots(roots, p)
 	if ok {
@@ -154,31 +218,47 @@ func ValidateSftpPath(roots []string, dirPolicy, op, p string) PathResult {
 	return PathResult{Allowed: false, Reason: fmt.Sprintf("路径 %q 不在 roots 内", p), AddRoot: suggest}
 }
 
-// confinePath 是命令路径门禁的核心：根据目录权限模式与操作读写属性判定是否放行。
-// 返回 (是否允许, 建议追加的根目录)。suggest=="" 表示命中系统目录（不可审批放宽）。
+// confinePath 是命令路径门禁的核心。
+//   - 把 "a:b"、"a,b"、"key=v" 之类的复合参数拆成片段，全部做系统目录硬封锁检查，
+//     修复 "docker -v /etc:/etc" 之类用冒号绕过 isProtected 的问题；
+//   - roots 判定取"第一个宿主机绝对路径片段"，避免把容器内路径 /app 误判越权；
+//   - ".." 一律硬拦截；远程标识符 remote:path 不受本地 roots 约束。
 func confinePath(roots []string, dp string, isWrite bool, raw string) (bool, string) {
 	if dp == DirOff {
 		return true, ""
 	}
+	segs := pathSegments(raw)
+	if len(segs) == 0 { // URL 等，不是本地路径
+		return true, ""
+	}
 	if isProtected(raw) {
-		return false, "" // 系统目录硬封锁，不可加 root
+		return false, ""
+	}
+	if strings.Contains(raw, "..") {
+		return false, ""
 	}
 	if dp == DirReadBeyond && !isWrite {
-		return true, "" // 读操作可超越 roots
+		return true, ""
 	}
-	return withinRoots(roots, raw)
+	if !strings.ContainsAny(raw, ":,=") {
+		// 单一路径参数：保持原语义（绝对路径校验 / 相对路径拒绝）
+		return withinRoots(roots, raw)
+	}
+	// 复合参数（挂载 / 远程标识符）：只有第一段是"宿主机本地绝对路径"时
+	// 才受 roots 约束。docker -v host:container 中冒号后是容器内路径，
+	// 命名卷 myvol:/app 中第一段不是路径——这两类都不该按宿主机 roots 判定。
+	if !strings.HasPrefix(segs[0], "/") {
+		return true, ""
+	}
+	return withinRoots(roots, segs[0])
 }
 
-// withinRoots 判断路径是否落在 roots 内（程序自动处理 ".." 穿越、相对路径越权、
-// 符号链接逃逸语义）。越权且非系统目录时返回建议加入的根目录。
 func withinRoots(roots []string, raw string) (bool, string) {
 	p := raw
-	if i := strings.Index(raw, "="); i >= 0 {
-		p = raw[i+1:]
+	if i := strings.LastIndex(p, "="); i >= 0 {
+		p = p[i+1:]
 	}
 	if !filepath.IsAbs(p) {
-		// 相对路径无法约束到具体根目录：含穿越或子路径则一律拒绝，
-		// 要求使用 roots 内的绝对路径。
 		return false, ""
 	}
 	clean := filepath.Clean(p)
@@ -188,38 +268,47 @@ func withinRoots(roots []string, raw string) (bool, string) {
 			return true, ""
 		}
 	}
-	// 越权但非系统目录：建议把合适的目录加入 roots（需人工审批）。
-	// 推断结果为 "/" 时不自动建议（避免一键放开整个文件系统）。
-	if root := suggestRoot(raw, clean); root != "/" {
+	if root := suggestRoot(p, clean); root != "/" {
 		return false, root
 	}
 	return false, ""
 }
 
-// isProtected 判断路径是否命中系统目录硬封锁。
+// isProtected 判断路径（或复合挂载参数的任一片段）是否命中系统目录硬封锁。
 func isProtected(raw string) bool {
-	p := raw
-	if i := strings.Index(raw, "="); i >= 0 {
-		p = raw[i+1:]
-	}
-	clean := filepath.Clean(p)
-	for _, sys := range protectedDirs {
-		if clean == sys || strings.HasPrefix(clean, sys+"/") {
-			return true
+	for _, seg := range pathSegments(raw) {
+		clean := filepath.Clean(seg)
+		for _, sys := range protectedDirs {
+			if clean == sys || strings.HasPrefix(clean, sys+"/") {
+				return true
+			}
 		}
 	}
 	return false
 }
 
-// looksLikePath 判断一个参数是不是"路径"（需要走路径门禁）。
-// 支持 key=value 形式（取 value 判断）、绝对路径、含 / 或 .. 的相对路径；
-// 以 - 开头的选项（如 -la）不算路径。
-func looksLikePath(arg string) bool {
-	if arg == "" {
-		return false
+// pathSegments 把复合参数拆成候选路径片段。
+// 处理：key=value、docker -v host:container、--mount a=x,b=y、rclone remote:path。
+// URL（含 ://）不是本地路径，返回 nil。
+func pathSegments(raw string) []string {
+	if strings.Contains(raw, "://") {
+		return nil
 	}
-	if i := strings.Index(arg, "="); i >= 0 {
-		return isPathLike(arg[i+1:])
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ':' || r == ',' || r == '='
+	})
+	out := make([]string, 0, len(parts))
+	for _, s := range parts {
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func looksLikePath(arg string) bool {
+	if arg == "" || strings.Contains(arg, "://") {
+		return false
 	}
 	return isPathLike(arg)
 }
@@ -231,14 +320,16 @@ func isPathLike(s string) bool {
 	if s == "." || s == ".." {
 		return true
 	}
-	return strings.Contains(s, "..") || strings.Contains(s, "/")
+	if strings.Contains(s, "/") || strings.Contains(s, "..") {
+		return true
+	}
+	return false
 }
 
-// suggestRoot 推断应加入 roots 的目录。
-//   - 显式以 "/" 结尾视为目录，直接取该目录；
-//   - 形如文件（base 含 "."，如 a/b.txt）取其所处目录；
-//   - 否则当作目录，取其自身（如 /tmp、/volume2），避免错误地取父目录 "/" 导致一键放开全文件系统。
 func suggestRoot(raw, clean string) string {
+	if !filepath.IsAbs(clean) {
+		return ""
+	}
 	if strings.HasSuffix(raw, "/") {
 		return clean
 	}
@@ -249,35 +340,149 @@ func suggestRoot(raw, clean string) string {
 	return clean
 }
 
-// stripSudo 剥离命令开头的一个 sudo 及其选项，返回剩余字段（真实命令在前）。
-// 支持：sudo cmd / sudo -n cmd / sudo -u user cmd / sudo -u=root cmd / sudo -H -n cmd。
-// 若首词不是 sudo 或剥离后为空，则原样返回。
-func stripSudo(fields []string) []string {
-	if len(fields) == 0 || fields[0] != "sudo" {
-		return fields
+// splitShellSegments 把复合命令按 ; && || | 换行 拆成独立子命令。
+// 引号内的分隔符不拆；命令替换 $()/反引号/进程替换 <( >( 与未闭合引号
+// 判定为不安全（ok=false），因为它们能执行任意隐藏命令。
+// 重定向 > < 与末尾单个 &（后台）保留语义但不引入新子命令。
+func splitShellSegments(cmd string) ([]shellSegment, bool) {
+	var segs []shellSegment
+	var cur strings.Builder
+	inSingle, inDouble, escaped := false, false, false
+	redirect := false
+	end := len(strings.TrimRight(cmd, " \t\r\n"))
+	flush := func() {
+		t := strings.TrimSpace(cur.String())
+		if t != "" {
+			segs = append(segs, shellSegment{text: t, redirect: redirect})
+		}
+		cur.Reset()
+		redirect = false
 	}
-	i := 1
-	for i < len(fields) {
-		tok := fields[i]
-		if tok == "--" {
-			i++
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+		if escaped {
+			cur.WriteByte(c)
+			escaped = false
+			continue
+		}
+		if inSingle {
+			cur.WriteByte(c)
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		if inDouble {
+			if c == '`' || (c == '$' && i+1 < len(cmd) && cmd[i+1] == '(') {
+				return nil, false
+			}
+			cur.WriteByte(c)
+			if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		switch c {
+		case '\\':
+			cur.WriteByte(c)
+			escaped = true
+		case '\'':
+			inSingle = true
+			cur.WriteByte(c)
+		case '"':
+			inDouble = true
+			cur.WriteByte(c)
+		case '`':
+			return nil, false
+		case '$':
+			if i+1 < len(cmd) && cmd[i+1] == '(' {
+				return nil, false
+			}
+			cur.WriteByte(c)
+		case '>', '<':
+			if i+1 < len(cmd) && cmd[i+1] == '(' {
+				return nil, false // 进程替换
+			}
+			if c == '>' && !(i+1 < len(cmd) && cmd[i+1] == '&') {
+				redirect = true // >&2 / 2>&1 是 fd 复制，不算写文件
+			}
+			cur.WriteByte(c)
+		case ';', '\n', '\r', '|':
+			flush()
+		case '&':
+			// 2>&1、>&2、&>file 中的 & 属于重定向；末尾单个 & 是后台执行
+			prev := byte(' ')
+			for k := i - 1; k >= 0; k-- {
+				if cmd[k] != ' ' && cmd[k] != '\t' {
+					prev = cmd[k]
+					break
+				}
+			}
+			if prev == '>' || (i+1 < len(cmd) && cmd[i+1] == '>') {
+				cur.WriteByte(c)
+				continue
+			}
+			if i == end-1 && (i == 0 || cmd[i-1] != '&') {
+				continue // 末尾后台符，丢弃即可
+			}
+			flush() // && 或 cmd1 & cmd2：拆成独立子命令
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	if inSingle || inDouble {
+		return nil, false
+	}
+	flush()
+	return segs, true
+}
+
+func hasWriteSubcommand(first string, args []string) bool {
+	set, ok := writeSubcommands[first]
+	if !ok {
+		return false
+	}
+	for _, a := range args {
+		if set[a] {
+			return true
+		}
+	}
+	return false
+}
+
+// stripPrefixes 剥离开头的 sudo/env/nohup/setsid 等包装命令及其选项/变量赋值，
+// 返回真实命令字段。若剥离后为空则原样返回，交由白名单判定处理。
+func stripPrefixes(fields []string) []string {
+	i := 0
+	for i < len(fields) && prefixCommands[fields[i]] {
+		i++
+		for i < len(fields) {
+			t := fields[i]
+			if t == "--" {
+				i++
+				break
+			}
+			if strings.HasPrefix(t, "-") {
+				if (t == "-u" || t == "-g" || t == "--user" || t == "--group" || t == "-n" || t == "-c") && i+1 < len(fields) {
+					i += 2
+				} else {
+					i++
+				}
+				continue
+			}
+			if strings.Contains(t, "=") { // 环境变量赋值
+				i++
+				continue
+			}
 			break
 		}
-		if !strings.HasPrefix(tok, "-") {
-			break // 找到真实命令
-		}
-		// -u/-g 单独出现时消耗下一个参数；-u=user/-g=group 形式不消耗
-		if (tok == "-u" || tok == "-g" || tok == "--user" || tok == "--group") && i+1 < len(fields) {
-			i += 2
-		} else {
-			i++
-		}
 	}
-	if i >= len(fields) {
-		return fields // sudo 后无命令，原样返回由后续判定处理
+	if i >= len(fields) || i == 0 {
+		return fields
 	}
 	return fields[i:]
 }
 
-// IsWriteCommand 供外部判断某命令是否为写命令（用于审计/提示）。
 func IsWriteCommand(name string) bool { return writeCommands[name] }

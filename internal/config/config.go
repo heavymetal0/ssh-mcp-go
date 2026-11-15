@@ -3,8 +3,11 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -41,10 +44,6 @@ type Defaults struct {
 //
 // 设计原则：配置只声明"意图"，复杂的策略判定（命令分类、路径门禁、
 // 穿越拦截、系统目录封锁）全部由 Go 程序实现，不写进配置文件。
-//   - allow_commands：允许执行的命令名列表（写命令名即可，无需正则）
-//   - roots：受保护的根目录列表，命令中的路径参数与所有 SFTP 操作都必须
-//     落在这些目录内；越权/穿越由程序自动拦截
-//   - read_only：true 时禁止一切写命令（即便列在 allow_commands）
 type Server struct {
 	Name          string   `toml:"name"`
 	Host          string   `toml:"host"`
@@ -66,8 +65,10 @@ type Config struct {
 	Servers    []Server `toml:"server"`
 	NeedsSetup bool     `toml:"-"` // 无配置文件或其中无任何服务器时为 true
 
-	mu     sync.RWMutex
-	stopFn func()
+	mu      sync.RWMutex // 保护 Defaults / Servers / NeedsSetup
+	writeMu sync.Mutex   // 串行化对配置文件的"读-改-写"
+	watchMu sync.Mutex   // 保护 stopFn / 监听生命周期
+	stopFn  func()
 }
 
 // Load 读取并解析配置文件。若文件不存在或其中没有任何服务器，
@@ -87,19 +88,24 @@ func Load(path string) (*Config, error) {
 	if len(c.Servers) == 0 {
 		c.NeedsSetup = true
 	}
+	c.normalize()
 	return c, nil
 }
 
+// normalize 补齐"配置里省略即用内置默认"的字段。
+// 手写 TOML 若省略 allow_commands，不能让白名单为空导致所有命令被拦；
+// 这里填充一份独立副本，避免多台服务器共享同一底层 slice。
+func (c *Config) normalize() {
+	for i := range c.Servers {
+		if len(c.Servers[i].AllowCommands) == 0 {
+			c.Servers[i].AllowCommands = append([]string(nil), DefaultAllowCommands...)
+		}
+	}
+}
+
 // DefaultAllowCommands 是内置的开箱即用命令白名单（首词，纯命令名，无正则）。
-//
-// 来源：原版 ssh-mcp 的 hitelist 白名单，按"安全 + 群晖常用"筛选并去重后重组。
-// 重写版的策略模型与原版不同：
-//   - 这里只声明"允许哪些命令首词"，不做整行正则匹配；
-//   - 命令里的路径参数由 roots + dir_policy 自动门禁（防穿越、系统目录封锁）；
-//   - 写/改类命令另由 policy.writeCommands 识别，受 read_only 与 roots 约束。
-//
-// 因此原版那些 sudo 前缀、全路径 docker、目录锚定等正则都不再需要——
-// 只要首词在此列表内，子命令与参数由 Go 程序统一判定。
+// 命令里的路径参数由 roots + dir_policy 自动门禁；写/改类命令另由
+// policy.writeCommands / writeSubcommands 识别，受 read_only 与 roots 约束。
 var DefaultAllowCommands = []string{
 	// ── 系统信息 / 监控（只读，路径无关）──
 	"uname", "hostname", "uptime", "date", "id", "who", "last", "which", "env",
@@ -126,8 +132,7 @@ var DefaultAllowCommands = []string{
 	"chmod", "chown", "chgrp", "rsync", "rclone", "dd", "truncate", "install",
 	"patch", "tee", "sed", "vi", "vim", "nano",
 	"bash", "sh", "nohup", "setsid", "python3", "pip3", "pip", "ssh",
-	// 注：sudo 作为前缀由策略层自动剥离，其后真实命令仍须在本列表内，
-	// 因此无需（也不应）把 sudo 本身当作可放行命令。
+	// 注：sudo / env / nohup 等前缀由策略层自动剥离，其后真实命令仍须在本列表内。
 }
 
 // DefaultDefaults 返回一组合理的默认超时/连接参数。
@@ -144,7 +149,24 @@ func DefaultDefaults() Defaults {
 	}
 }
 
-// HostKeyPolicy 返回生效的主机密钥校验策略（缺省 insecure）。
+// —— 配置读取辅助（全部加锁，避免与热重载 Reload 产生 data race）——
+
+func (c *Config) defaultsSnapshot() Defaults {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Defaults
+}
+
+// DefaultsSnapshot 返回 defaults 的线程安全快照，供其他包读取。
+func (c *Config) DefaultsSnapshot() Defaults { return c.defaultsSnapshot() }
+
+// NeedSetup 返回当前是否缺少可用服务器配置（线程安全）。
+func (c *Config) NeedSetup() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.NeedsSetup
+}
+
 func (c *Config) HostKeyPolicy() string {
 	p := strings.TrimSpace(c.defaultsSnapshot().HostKeyPolicy)
 	if p == "" {
@@ -153,7 +175,6 @@ func (c *Config) HostKeyPolicy() string {
 	return p
 }
 
-// KnownHostsFile 返回 known_hosts 文件路径（缺省 ~/.ssh/known_hosts）。
 func (c *Config) KnownHostsFile() string {
 	f := strings.TrimSpace(c.defaultsSnapshot().KnownHostsFile)
 	if f == "" {
@@ -161,10 +182,6 @@ func (c *Config) KnownHostsFile() string {
 	}
 	return f
 }
-
-// —— 时长 / 上限解析辅助 ——
-// 这些值集中在此解析，确保"配置文件里写了就生效、没写就用兜底值"，
-// 避免各调用点各写一套默认值导致不一致。
 
 // ParseDuration 把 TOML 里的时长字符串解析为 time.Duration。
 // 空值、负数或格式非法时返回 fallback。
@@ -180,48 +197,32 @@ func ParseDuration(s string, fallback time.Duration) time.Duration {
 	return d
 }
 
-// defaultsSnapshot 读取 defaults 的快照（加读锁），供下面各 getter 使用。
-func (c *Config) defaultsSnapshot() Defaults {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.Defaults
-}
-
-// ConnectionTimeout 返回生效的 SSH 建连超时（缺省 30s）。
 func (c *Config) ConnectionTimeout() time.Duration {
 	return ParseDuration(c.defaultsSnapshot().ConnectionTimeout, 30*time.Second)
 }
-
-// CommandTimeout 返回生效的命令执行默认超时（缺省 120m）。
 func (c *Config) CommandTimeout() time.Duration {
 	return ParseDuration(c.defaultsSnapshot().CommandTimeout, 120*time.Minute)
 }
-
-// KeepaliveInterval 返回心跳间隔（缺省 15s）。
+func (c *Config) SftpTimeout() time.Duration {
+	return ParseDuration(c.defaultsSnapshot().SftpTimeout, 5*time.Minute)
+}
 func (c *Config) KeepaliveInterval() time.Duration {
 	return ParseDuration(c.defaultsSnapshot().KeepaliveInterval, 15*time.Second)
 }
-
-// KeepaliveCountMax 返回连续心跳失败多少次后判定连接失效（缺省 3）。
 func (c *Config) KeepaliveCountMax() int {
 	if n := c.defaultsSnapshot().KeepaliveCountMax; n > 0 {
 		return n
 	}
 	return 3
 }
-
-// MaxOutputBytes 返回命令输出上限字节数（缺省 20MB，对应 DefaultDefaults）。
 func (c *Config) MaxOutputBytes() int {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.Defaults.MaxOutputBytes > 0 {
-		return c.Defaults.MaxOutputBytes
+	if n := c.defaultsSnapshot().MaxOutputBytes; n > 0 {
+		return n
 	}
 	return DefaultDefaults().MaxOutputBytes
 }
 
 // WriteConfig 将完整配置写出为 TOML 文件（chmod 600），用于向导首次生成。
-// 文件顶部的注释说明由向导生成，正文由 go-toml 序列化（保留字段顺序）。
 func WriteConfig(path string, c *Config) error {
 	var sb strings.Builder
 	sb.WriteString("# 由 setup-wizard 自动生成\n")
@@ -231,10 +232,10 @@ func WriteConfig(path string, c *Config) error {
 		return err
 	}
 	sb.Write(data)
-	return os.WriteFile(path, []byte(sb.String()), 0o600)
+	return writeAtomic(path, []byte(sb.String()))
 }
 
-// Reload 从磁盘重新解析配置并替换内存状态。
+// Reload 从磁盘重新解析配置并替换内存状态。解析失败时保留旧配置。
 func (c *Config) Reload() error {
 	data, err := os.ReadFile(c.Path)
 	if err != nil {
@@ -244,47 +245,105 @@ func (c *Config) Reload() error {
 	if err := toml.Unmarshal(data, tmp); err != nil {
 		return err
 	}
+	tmp.normalize()
 	c.mu.Lock()
 	c.Defaults = tmp.Defaults
 	c.Servers = tmp.Servers
+	c.NeedsSetup = len(tmp.Servers) == 0 // 向导生成/手动清空后同步更新
 	c.mu.Unlock()
 	return nil
 }
 
-// Watch 监听配置文件变化并自动重载（热重载）。
-// 返回停止函数。
+// Watch 监听配置文件所在目录并自动热重载。监听目录而非文件，
+// 是为了兼容编辑器的"写临时文件 + rename 覆盖"保存方式（原实现监听文件，
+// rename 后 inode 变化会永久丢失监听，热重载悄悄失效）。
 func (c *Config) Watch() (func(), error) {
+	c.watchMu.Lock()
+	defer c.watchMu.Unlock()
+	return c.watchLocked()
+}
+
+// watchLocked 在持有 watchMu 的前提下启动监听，避免 EnsureWatch 的 TOCTOU 竞态。
+func (c *Config) watchLocked() (func(), error) {
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
 	}
-	if err := w.Add(c.Path); err != nil {
+	dir := filepath.Dir(c.Path)
+	if dir == "" {
+		dir = "."
+	}
+	if err := w.Add(dir); err != nil {
 		w.Close()
 		return nil, err
 	}
+	target := filepath.Base(c.Path)
+	var once sync.Once
+	stop := func() {
+		once.Do(func() { _ = w.Close() })
+	}
 	go func() {
-		for ev := range w.Events {
-			if ev.Op&(fsnotify.Write|fsnotify.Create) != 0 {
-				_ = c.Reload()
+		var timer *time.Timer
+		var timerC <-chan time.Time
+		for {
+			select {
+			case ev, ok := <-w.Events:
+				if !ok {
+					return
+				}
+				if filepath.Base(ev.Name) != target {
+					continue
+				}
+				if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) == 0 {
+					continue
+				}
+				// 去抖：一次保存常触发多个事件，合并为一次 Reload
+				if timer == nil {
+					timer = time.NewTimer(80 * time.Millisecond)
+				} else if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+					timer.Reset(80 * time.Millisecond)
+				}
+				timerC = timer.C
+			case <-timerC:
+				timerC, timer = nil, nil
+				if err := c.Reload(); err != nil {
+					log.Printf("配置热重载失败（保留旧配置）: %v", err)
+				}
+			case err, ok := <-w.Errors:
+				if !ok {
+					return
+				}
+				log.Printf("配置监听错误: %v", err)
 			}
 		}
 	}()
-	stop := func() { w.Close() }
 	c.stopFn = stop
 	return stop, nil
 }
 
-// EnsureWatch 在尚未监听时启动热重载监听（用于向导首次生成配置文件后，
-// 让新文件也能被后续热重载生效）。
+// EnsureWatch 在尚未监听时启动热重载监听（用于向导首次生成配置文件后）。
 func (c *Config) EnsureWatch() error {
-	c.mu.Lock()
+	c.watchMu.Lock()
+	defer c.watchMu.Unlock()
 	if c.stopFn != nil {
-		c.mu.Unlock()
 		return nil
 	}
-	c.mu.Unlock()
-	_, err := c.Watch()
+	_, err := c.watchLocked()
 	return err
+}
+
+// StopWatch 停止热重载监听（进程退出时清理 goroutine）。
+func (c *Config) StopWatch() {
+	c.watchMu.Lock()
+	defer c.watchMu.Unlock()
+	if c.stopFn != nil {
+		c.stopFn()
+		c.stopFn = nil
+	}
 }
 
 // GetServers 返回当前服务器列表（加读锁）。
@@ -297,57 +356,68 @@ func (c *Config) GetServers() []Server {
 }
 
 // ServerByName 按名称查找服务器。
+// name 为空时返回默认（第一个）服务器；显式指定名称找不到时返回 false，
+// 绝不再静默回退到别的服务器——否则命令可能打到完全无关的主机上。
 func (c *Config) ServerByName(name string) (Server, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	if len(c.Servers) == 0 {
+		return Server{}, false
+	}
+	if name == "" {
+		return c.Servers[0], true
+	}
 	for _, s := range c.Servers {
 		if s.Name == name {
 			return s, true
 		}
 	}
-	if len(c.Servers) > 0 {
-		return c.Servers[0], true // 无匹配时默认第一个
-	}
 	return Server{}, false
 }
 
-// ApprovalModeOf 返回服务器实际生效的审批模式。
-// server 级 approval_mode 优先；为空则取 defaults；再为空则默认 ask（交互）。
+// ApprovalModeOf 返回服务器实际生效的审批模式（加锁读 defaults，避免与 Reload 竞态）。
 func (c *Config) ApprovalModeOf(srv Server) string {
 	m := srv.ApprovalMode
 	if m == "" {
-		m = c.Defaults.ApprovalMode
+		m = c.defaultsSnapshot().ApprovalMode
 	}
+	m = strings.ToLower(strings.TrimSpace(m))
 	if m == ApprovalDeny {
 		return ApprovalDeny
 	}
 	return ApprovalAsk
 }
 
-// AppendAllowCommand 向指定服务器的 allow_commands 追加一个命令名：
-// 1) 更新内存状态；2) 以"定点行插入"方式写回文件以保留注释。
+// AppendAllowCommand 向指定服务器的 allow_commands 追加一个命令名。
+// 先写文件、成功后 Reload 更新内存：写失败不污染内存，保证两者一致。
 func (c *Config) AppendAllowCommand(serverName, cmd string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for i := range c.Servers {
-		if c.Servers[i].Name == serverName {
-			c.Servers[i].AllowCommands = append(c.Servers[i].AllowCommands, cmd)
-		}
+	c.writeMu.Lock()
+	err := insertIntoArray(c.Path, serverName, "allow_commands", cmd)
+	if errors.Is(err, errArrayNotFound) {
+		// 手写 TOML 省略了 allow_commands 行：以内存中的默认白名单为基础，
+		// 在目标 [[server]] 段内补写完整数组行，保证审批放行能真正落盘。
+		err = insertMissingArray(c.Path, serverName, "allow_commands", c.currentAllowCommands(serverName), cmd)
 	}
-	return insertIntoArray(c.Path, serverName, "allow_commands", cmd)
+	c.writeMu.Unlock()
+	if err != nil {
+		return err
+	}
+	return c.Reload()
 }
 
 // AppendRoot 向指定服务器的 roots 追加一个受保护根目录。
 func (c *Config) AppendRoot(serverName, root string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for i := range c.Servers {
-		if c.Servers[i].Name == serverName {
-			c.Servers[i].Roots = append(c.Servers[i].Roots, root)
-		}
+	c.writeMu.Lock()
+	err := insertIntoArray(c.Path, serverName, "roots", root)
+	c.writeMu.Unlock()
+	if err != nil {
+		return err
 	}
-	return insertIntoArray(c.Path, serverName, "roots", root)
+	return c.Reload()
 }
+
+// errArrayNotFound 表示目标 [[server]] 段里压根没有这个数组行（可自动补写）。
+var errArrayNotFound = errors.New("配置段中不存在该数组行")
 
 // insertIntoArray 在 TOML 文件中目标服务器的指定数组里插入一个带引号的元素，
 // 其余内容与注释保持不变。同时兼容"单行内联数组"与"多行数组"两种写法。
@@ -369,52 +439,164 @@ func insertIntoArray(path, serverName, key, value string) error {
 			inServer = true
 			continue
 		}
-		if !inServer {
+		if !inServer || !strings.HasPrefix(trim, key) {
 			continue
 		}
-		if !strings.HasPrefix(trim, key+" = [") {
+		rest := strings.TrimSpace(trim[len(key):])
+		if !strings.HasPrefix(rest, "=") {
 			continue
 		}
-		// 单行内联数组：whitelist = [ a, b ]
-		if strings.Contains(trim, "]") {
-			open := strings.Index(trim, "[")
-			close := strings.LastIndex(trim, "]")
-			inner := strings.TrimSpace(trim[open+1 : close])
-			if inner == "" {
-				lines[i] = indentOf(line) + key + " = [ " + quoted + " ]"
-			} else {
-				lines[i] = indentOf(line) + key + " = [ " + inner + ", " + quoted + " ]"
+		// 单行内联数组：key = [ a, b ]
+		if strings.Contains(rest, "]") {
+			open := strings.Index(rest, "[")
+			close := strings.LastIndex(rest, "]")
+			if open < 0 || close < open {
+				return fmt.Errorf("数组 %s 格式异常", key)
 			}
-			return writeLines(path, lines)
+			inner := strings.TrimSpace(rest[open+1 : close])
+			newInner := quoted
+			if inner != "" {
+				newInner = inner + ", " + quoted
+			}
+			lines[i] = indentOf(line) + key + " = [ " + newInner + " ]"
+			return writeAtomicLines(path, lines)
 		}
-		// 多行数组：在闭合的 ] 行之前插入
+		// 多行数组：在闭合的 ] 行之前插入。
+		// 关键修复：给"最后一个真实元素行"补逗号，而不是 ] 的上一行——
+		// 示例配置中 ] 前是一行注释，给注释补逗号会写出非法 TOML。
 		for j := i + 1; j < len(lines); j++ {
-			if strings.TrimSpace(lines[j]) == "]" {
-				prev := lines[j-1]
-				if strings.TrimSpace(prev) == key+" = [" {
-					// 空数组：直接放入首个元素
-					lines[j] = "  " + quoted + "\n" + lines[j]
-				} else {
-					// 给原"最后一个元素"补逗号（它不再是末尾了）
-					if !strings.HasSuffix(strings.TrimRight(prev, " \t"), ",") {
-						lines[j-1] = prev + ","
-					}
-					lines[j] = "  " + quoted + "\n" + lines[j]
-				}
-				return writeLines(path, lines)
+			if !strings.HasPrefix(strings.TrimSpace(lines[j]), "]") {
+				continue
 			}
+			last := -1
+			for k := j - 1; k > i; k-- {
+				tk := strings.TrimSpace(lines[k])
+				if tk == "" || strings.HasPrefix(tk, "#") {
+					continue
+				}
+				last = k
+				break
+			}
+			if last >= 0 {
+				lines[last] = ensureTrailingComma(lines[last])
+			}
+			// 新元素带尾逗号，TOML 允许数组尾随逗号
+			lines[j] = "  " + quoted + ",\n" + lines[j]
+			return writeAtomicLines(path, lines)
 		}
 		return fmt.Errorf("未找到数组 %s 的结束符", key)
 	}
-	return fmt.Errorf("未在服务器 %s 找到数组 %s", serverName, key)
+	return fmt.Errorf("服务器 %s: %w: %s", serverName, errArrayNotFound, key)
 }
 
-// indentOf 返回一行的缩进（前导空白）。
+// ensureTrailingComma 给数组元素行补逗号，且只在引号外的代码部分补，
+// 避免把逗号加到行尾注释里（如 "ssh"  # 说明）。
+func ensureTrailingComma(line string) string {
+	inQuote := false
+	cut := -1
+	for idx, r := range line {
+		if r == '"' {
+			inQuote = !inQuote
+			continue
+		}
+		if r == '#' && !inQuote {
+			cut = idx
+			break
+		}
+	}
+	code, comment := line, ""
+	if cut >= 0 {
+		code, comment = line[:cut], line[cut:]
+	}
+	code = strings.TrimRight(code, " \t")
+	if strings.HasSuffix(code, ",") {
+		return line
+	}
+	if comment != "" {
+		return code + ",  " + comment
+	}
+	return code + ","
+}
+
 func indentOf(line string) string {
 	return line[:len(line)-len(strings.TrimLeft(line, " \t"))]
 }
 
-// writeLines 将行数组写回文件并保留 0600 权限。
-func writeLines(path string, lines []string) error {
-	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o600)
+// writeAtomicLines / writeAtomic 用"同目录临时文件 + rename"原子替换，
+// 避免热重载监听到写了一半的文件，也让目录监听能收到完整的 Rename 事件。
+func writeAtomicLines(path string, lines []string) error {
+	return writeAtomic(path, []byte(strings.Join(lines, "\n")))
+}
+
+func writeAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".ssh-mcp-*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
+}
+
+// currentAllowCommands 返回指定服务器当前生效的白名单副本。
+func (c *Config) currentAllowCommands(serverName string) []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, s := range c.Servers {
+		if s.Name == serverName {
+			return append([]string(nil), s.AllowCommands...)
+		}
+	}
+	return append([]string(nil), DefaultAllowCommands...)
+}
+
+// insertMissingArray 处理"配置文件里压根没有 allow_commands 这一行"的情况：
+// 在目标 [[server]] 段内、下一段开始之前，插入一份完整的多行数组。
+func insertMissingArray(path, serverName, key string, existing []string, value string) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(data), "\n")
+	nameLine := -1
+	for i, line := range lines {
+		trim := strings.TrimSpace(line)
+		if strings.HasPrefix(trim, "name") && strings.Contains(trim, `"`+serverName+`"`) {
+			nameLine = i
+			break
+		}
+	}
+	if nameLine < 0 {
+		return fmt.Errorf("未在配置中找到服务器 %s", serverName)
+	}
+	insertAt := len(lines)
+	for j := nameLine + 1; j < len(lines); j++ {
+		if strings.HasPrefix(strings.TrimSpace(lines[j]), "[") {
+			insertAt = j
+			break
+		}
+	}
+	quote := func(s string) string { return `"` + strings.ReplaceAll(s, `"`, `\"`) + `"` }
+	block := []string{"  " + key + " = ["}
+	for _, e := range existing {
+		block = append(block, "    "+quote(e)+",")
+	}
+	block = append(block, "    "+quote(value)+",", "  ]")
+	out := make([]string, 0, len(lines)+len(block))
+	out = append(out, lines[:insertAt]...)
+	out = append(out, block...)
+	out = append(out, lines[insertAt:]...)
+	return writeAtomicLines(path, out)
 }
