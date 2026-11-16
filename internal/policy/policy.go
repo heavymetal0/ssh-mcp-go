@@ -201,7 +201,7 @@ func ValidateSftpPath(roots []string, dirPolicy, op, p string) PathResult {
 	if isProtected(p) {
 		return PathResult{Allowed: false, Reason: fmt.Sprintf("路径 %q 命中系统目录，已被拦截", p)}
 	}
-	if strings.Contains(p, "..") {
+	if strings.Contains(unquote(p), "..") {
 		return PathResult{Allowed: false, Reason: fmt.Sprintf("路径 %q 含目录穿越，已被拦截", p)}
 	}
 	isWrite := op == "write"
@@ -234,7 +234,7 @@ func confinePath(roots []string, dp string, isWrite bool, raw string) (bool, str
 	if isProtected(raw) {
 		return false, ""
 	}
-	if strings.Contains(raw, "..") {
+	if strings.Contains(unquote(raw), "..") {
 		return false, ""
 	}
 	if dp == DirReadBeyond && !isWrite {
@@ -254,7 +254,7 @@ func confinePath(roots []string, dp string, isWrite bool, raw string) (bool, str
 }
 
 func withinRoots(roots []string, raw string) (bool, string) {
-	p := raw
+	p := unquote(raw)
 	if i := strings.LastIndex(p, "="); i >= 0 {
 		p = p[i+1:]
 	}
@@ -299,11 +299,31 @@ func pathSegments(raw string) []string {
 	})
 	out := make([]string, 0, len(parts))
 	for _, s := range parts {
+		// strings.Fields 不解析 shell 引号，路径片段可能带成对或散落的
+		// ' / "。若不剥离，filepath.Clean("'/etc/shadow'") 不再以 /etc
+		// 开头，可绕过 protectedDirs 硬封锁（如 cat '/etc/shadow'）。
+		s = unquote(s)
 		if s != "" {
 			out = append(out, s)
 		}
 	}
 	return out
+}
+
+// unquote 去掉 token 里的 shell 引号字符（单引号、双引号）。
+// 命令行经 strings.Fields 分词后，引号会原样留在参数里；路径门禁必须
+// 在引号剥离后再做 Clean/前缀匹配，否则 /etc 这类系统目录可被引号包住绕过。
+// 这里刻意去掉所有引号（含零散的 /etc'/shadow'），比只处理成对引号更稳妥。
+func unquote(s string) string {
+	if !strings.ContainsAny(s, "'\"") {
+		return s
+	}
+	return strings.Map(func(r rune) rune {
+		if r == '\'' || r == '"' {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 func looksLikePath(arg string) bool {
