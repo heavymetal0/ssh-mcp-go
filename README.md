@@ -1,5 +1,9 @@
 # ssh-mcp-go
 
+[![Latest Release](https://img.shields.io/github/v/release/heavymetal0/ssh-mcp-go)](https://github.com/heavymetal0/ssh-mcp-go/releases) [![Go](https://img.shields.io/badge/built%20with-Go-00ADD8)](https://go.dev/)
+
+> **版本记录**：当前版本见上方徽章；完整迭代说明见 [CHANGELOG.md](./CHANGELOG.md) 与 [Releases](https://github.com/heavymetal0/ssh-mcp-go/releases)。版本从 `v0.1.0` 起，遵循语义化版本。
+
 基于 Go 全量重写的 **SSH MCP 服务**，让 AI Agent 通过标准 MCP 协议安全地控制 SSH / SFTP 主机（典型场景：群晖 NAS、任意 Linux 服务器）。
 
 它是原版 `ssh-mcp` 的**完整替代实现**，不依赖原程序。相比原版最大的增强是**对话式审批（HITL）**：命令或路径被安全策略拦截时，不再直接失败，而是让 Agent 询问用户是否放行；放行后自动写回配置、热重载并重试。
