@@ -13,6 +13,16 @@
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- 修复**带 `sudo` 等前缀时用绝对路径调用命令被误拦**的问题。此前 `validateSegment` 的路径门禁遍历含前缀的原始 `fields[1:]`，命令本体路径（如群晖 `/var/packages/ContainerManager/target/usr/bin/docker`）会掉进"参数路径"范围，误命中 `/var` 系统目录硬封锁——导致同一条 docker 命令"不带 sudo 能跑、带 sudo 被拦"。现统一改为基于剥离前缀后的 `cmdFields[1:]`：写子命令判定与路径门禁都只看真实命令的参数；命令本体路径仅受 `allow_commands` 白名单约束（已由 `first` 校验），不被重复当作参数路径检查。
+- 被剥离的前缀 token（`sudo` / `-S` / 环境变量赋值等）不是传给真实命令的文件参数，跳过其路径检查不会放宽越权判定；`/etc` 挂载、`rm /etc`、引号绕过、复合命令夹带等既有一切拦截保持不变。
+
+> 本次为未发布修复，未新建版本号 / Tag / Release。
+
+---
+
 ## [v0.3.1] - 2026-11-16
 
 ### Security

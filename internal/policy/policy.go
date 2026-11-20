@@ -158,12 +158,17 @@ func validateSegment(allowCommands, roots []string, readOnly bool, dirPolicy str
 			AddCommand: first,
 		}
 	}
-	isWrite := writeCommands[first] || seg.redirect || hasWriteSubcommand(first, fields[1:])
+	// 写子命令与路径门禁都必须基于"剥离前缀后的真实命令参数" cmdFields[1:]，
+	// 不能用含 sudo/env 前缀的原始 fields[1:]：否则 "sudo /var/packages/.../docker"
+	// 会把命令本体路径当成参数去检查，误命中 /var 系统目录（命令本体路径只应受
+	// 白名单约束，first 已校验过）。被剥离的前缀 token（sudo/-S/变量赋值）不是
+	// 传给真实命令的文件参数，跳过其路径检查不会放宽真实命令的越权判定。
+	isWrite := writeCommands[first] || seg.redirect || hasWriteSubcommand(first, cmdFields[1:])
 	if readOnly && isWrite {
 		return CommandResult{Blocked: true, Reason: fmt.Sprintf("当前为只读模式，禁止写命令/写操作 %q", first)}
 	}
 	dp := normalizeDirPolicy(dirPolicy)
-	for _, f := range fields[1:] {
+	for _, f := range cmdFields[1:] {
 		if !looksLikePath(f) {
 			continue
 		}

@@ -279,6 +279,7 @@ read_only  = false
 - `docker compose -f /volume/docker/proj/compose.yaml up -d` — 子命令不单独校验，但 `-f` 路径仍须落在 `roots` 内
 - `ps aux | grep docker` / `cmd1 && cmd2` — 两段各自都须合法
 - `sudo docker ps` / `env FOO=1 docker ps` — 剥离前缀后按真实命令 `docker` 校验
+- 用绝对路径调用命令本体（如群晖 `sudo /var/packages/ContainerManager/target/usr/bin/docker ps`）时，该路径只按白名单校验、不会被当成参数路径重复检查，因此**带不带 sudo 行为一致**；`sudo -S` 等其他前缀同理
 
 `docker-compose`（旧版独立命令）首词不同，需单独加入白名单。注意 **`docker` 在白名单里不代表所有子命令在 `read_only` 下都放行**：`docker rm/up/down`、`systemctl restart`、`curl -o`、`find -delete` 这类有写副作用的子命令由程序识别并拦截。
 
